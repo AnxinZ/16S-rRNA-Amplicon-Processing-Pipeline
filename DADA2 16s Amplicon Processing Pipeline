@@ -1,4 +1,4 @@
-#Dada2 16s Amplicon Processing Pipeline
+#DADA2 16s Amplicon Processing Pipeline
 
 #Load libraries
 library(dada2)
