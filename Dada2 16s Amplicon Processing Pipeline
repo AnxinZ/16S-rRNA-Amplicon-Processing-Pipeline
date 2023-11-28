@@ -1,0 +1,141 @@
+#Dada2 16s Amplicon Processing Pipeline
+
+#Load libraries
+library(dada2)
+library(phyloseq)
+library(Biostrings)
+library(ggplot2)
+library(randomcoloR)
+library(dplyr)
+
+#Set the working directory
+setwd(“yourworking dir”)
+# or by clicking session > set working directory > yourworking dir
+
+#making a object called path, list it to check
+path<- "/your/path/to/the/working/dir/"
+list.files(path)
+
+# For sampes, the forward fastq filenames have format: SAMPLENAME_R1_001.fastq; And the reverse fastq filenames have format: SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+
+#visualize the quality profiles of the forward reads to check the quality of the data
+#look at the green line
+plotQualityProfile(fnFs[1:2])
+
+#making a filtered file for both forward and reverse read
+#place filtered sample in filtered/ subdirectory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+#filter and trim
+#sets the maximum number of “expected errors” allowed in a read, which is a better filter than simply averaging quality scores
+#estimate cutoff are 180 and 250 from the plots
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(250,180),
+              maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE) 
+head(out)
+
+#learn the error rates and visualize it
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+plotErrors(errF, nominalQ=TRUE)
+
+#look at sample inference
+#assessing unique sequences
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+dadaFs[[1]]
+
+#merge paired read
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+
+#inspect the merger data.frame from the first sample
+head(mergers[[1]])
+
+#construct an amplicon sequence variant table (ASV) table called seqtab
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+#inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+
+#remove chimeras of seqtab and make it as an object as seqtab.nochim
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+
+#track reads through the pipeline
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+
+#assign taxonomy
+taxa <- assignTaxonomy(seqtab.nochim, "~/your/working/dir/silva_nr99_v138.1_train_set.fa.gz", multithread=TRUE)
+
+#make csv files
+write.csv(taxa, file ="/your/working/dir/taxa.csv")
+write.csv(seqtab.nochim, file = "/your/working/dir/seqtab.nochim.csv")
+
+#read csv files into R
+taxa<- read.csv(file= "/your/working/dir/taxa.csv", sep=",", row.names=1)
+seqtab.nochim<- read.csv(file= "/your/working/dir/seqtab.nochim.csv", sep=",", row.names=1)
+
+#transpose (flip) the seqtab.nochim
+flipped_seqtab.nochim<-as.data.frame (t(seqtab.nochim))                                    
+dim(seqtab.nochim)
+
+#combine flipped_seqtab and taxa in to one csv file
+OTUabund <-cbind(flipped_seqtab.nochim, taxa)
+write.csv(OTUabund, file ="/your/working/dir/OTUabund.csv" )
+
+#construct a simple sample data.frame from the information encoded in the filenames.
+samples.out <- rownames(seqtab.nochim)
+samdf <- data.frame(samples.out)
+rownames(samdf) <- samples.out
+
+#convert objects into matrix
+seqtab.nochim<-as.matrix(seqtab.nochim)
+taxa<-as.matrix(taxa)
+
+#hand off data to phyloseq
+ps <-phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(samdf), 
+               tax_table(taxa))
+
+#store the DNA sequences of our ASVs in the refseq slot of the phyloseq object, and rename taxa to a short string
+dna <- Biostrings::DNAStringSet(taxa_names(ps))
+names(dna) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna)
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+ps
+
+#take phyloseq data into dataframe
+ps.table<-psmelt(ps)
+#factor the phyla column
+ps.table$Phylum <- factor(ps.table$Phylum)
+
+#if we need to present data as relative abundance
+ps.prop <- transform_sample_counts(ps, function(OTU) OTU/sum(OTU))
+#melt phyloseq data object into dataframe
+ps.proptable <- psmelt(ps.prop)
+#factor phyla column
+ps.proptable$Phylum<-factor(ps.proptable$Phylum)
+
+#make graphs
+#plot the relative abundance of phyla
+ggplot(data = ps.proptable, mapping=aes(x=Sample,y=Abundance))+geom_bar(aes(fill=Phylum), stat="identity", position="stack")+scale_x_discrete(limit = c("Nig-ALH1","Nig-ALNeg","Nig-ALT2"),labels = c("Hummock","Neg","Trough"))+labs(y="relative abundance",title="Relative Abundance of Phyla")
+
+#plot the relative abundance of order
+ggplot(data = ps.proptable, mapping=aes(x=Sample,y=Abundance))+geom_bar(aes(fill=Order), stat="identity", position="stack")+scale_x_discrete(limit = c("Nig-ALH1","Nig-ALNeg","Nig-ALT2"),labels = c("Hummock","Neg","Trough"))+labs(y="relative abundance",title="Relative Abundance of Order")
+
+
